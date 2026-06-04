@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sentinel-2 COG 指数计算器</title>
+    
+    <!-- MapLibre GL JS -->
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    
+    <!-- Terraformer for drawing -->
+    <script src="https://unpkg.com/@terraformer/wkt"></script>
+    <script src="https://unpkg.com/@turf/turf/turf.min.js"></script>
+    
+    <!-- Georaster and Georaster-layer -->
+    <!-- 注意：georaster-layer-for-maplibre 可能需要特定的适配，这里我们采用一种更通用的方式：
+         使用 georaster 获取数据，然后生成一个动态的 Canvas 源或 ImageOverlay -->
+    <script src="https://unpkg.com/georaster"></script>
+    <script src="https://unpkg.com/georaster-layer-for-leaflet/dist/georaster-layer-for-leaflet.min.js"></script>
+    <!-- 由于 georaster-layer 主要针对 Leaflet，我们在 MapLibre 中将通过自定义 Canvas 源来实现渲染逻辑 -->
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { width: 100%; height: 100vh; }
+        .controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.2);
+            z-index: 1000;
+            max-width: 300px;
+        }
+        .control-group { margin-bottom: 10px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        select, button { width: 100%; padding: 8px; margin-bottom: 5px; }
+        button { background-color: #007cbf; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #005a8c; }
+        button:disabled { background-color: #ccc; }
+        .legend {
+            margin-top: 10px;
+            font-size: 12px;
+        }
+        .gradient-bar {
+            height: 20px;
+            width: 100%;
+            background: linear-gradient(to right, 
+                red 0%, 
+                yellow 50%, 
+                green 100%); /* 默认 NDVI */
+            margin-bottom: 5px;
+        }
+        .loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 20px;
+            border-radius: 5px;
+            display: none;
+            z-index: 2000;
+        }
+    </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div class="controls">
+    <h3>COG 指数分析</h3>
+    <div class="control-group">
+        <label>1. 绘制区域</label>
+        <button id="drawBtn">开始绘制多边形</button>
+        <button id="clearBtn" style="background-color: #d9534f;">清除绘制</button>
+    </div>
+    
+    <div class="control-group">
+        <label>2. 选择数据源 (COG URL)</label>
+        <input type="text" id="cogUrl" value="" placeholder="输入 Sentinel-2 COG URL" style="width: 90%; font-size: 12px;">
+        <small style="color: #666; font-size: 10px;">示例: Element84 或其他 STAC API 生成的 COG 链接</small>
+    </div>
+
+    <div class="control-group">
+        <label>3. 选择指数</label>
+        <select id="indexSelect">
+            <option value="NDVI">NDVI (植被指数)</option>
+            <option value="NDWI">NDWI (水体指数)</option>
+            <option value="EVI">EVI (增强植被指数)</option>
+            <option value="NDBI">NDBI (建筑指数)</option>
+        </select>
+    </div>
+
+    <div class="control-group">
+        <button id="calculateBtn" disabled>计算并渲染</button>
+    </div>
+
+    <div class="legend" id="legend" style="display:none;">
+        <label>图例 (<span id="legendName">NDVI</span>)</label>
+        <div class="gradient-bar" id="legendBar"></div>
+        <div style="display:flex; justify-content:space-between;">
+            <span id="minVal">-1</span>
+            <span id="maxVal">1</span>
+        </div>
+    </div>
+</div>
+
+<div id="loading" class="loading">正在处理数据...</div>
+
+<script>
+    // --- 配置与状态 ---
+    const state = {
+        map: null,
+        drawMode: false,
+        polygon: null,
+        cogUrl: '',
+        currentLayerId: 'cog-analysis-layer'
+    };
+
+    // Sentinel-2 波段定义 (L2A COG 通常遵循此命名或数字索引)
+    // 注意：实际 COG 的波段索引可能因提供商而异，这里假设标准顺序或使用元数据
+    // 常见顺序: B1, B2, B3, B4(Red), B5, B6, B7, B8(NIR), B8A, B9, B10, B11, B12
+    const BANDS = {
+        'Blue': 2,   // Index 1 (0-based) or Band ID
+        'Green': 3,  // Index 2
+        'Red': 4,    // Index 3
+        'NIR': 8,    // Index 7
+        'SWIR': 11   // Index 10
+    };
+
+    // 初始化地图
+    function initMap() {
+        state.map = new maplibregl.Map({
+            container: 'map',
+            style: 'https://demotiles.maplibre.org/style.json', // 开源底图
+            center: [116.397, 39.908], // 北京
+            zoom: 10
+        });
+
+        state.map.addControl(new maplibregl.NavigationControl());
+        
+        // 监听地图点击用于绘制
+        state.map.on('click', handleMapClick);
+        state.map.on('mousemove', handleMouseMove);
+    }
+
+    // --- 绘制逻辑 (简易版) ---
+    let tempPoints = [];
+    let tempMarker = null;
+
+    document.getElementById('drawBtn').addEventListener('click', () => {
+        state.drawMode = !state.drawMode;
+        tempPoints = [];
+        if (state.polygon) {
+            clearPolygon();
+        }
+        const btn = document.getElementById('drawBtn');
+        btn.textContent = state.drawMode ? "绘制中... (点击结束)" : "开始绘制多边形";
+        btn.style.backgroundColor = state.drawMode ? "#d9534f" : "#007cbf";
+        state.map.getCanvas().style.cursor = state.drawMode ? 'crosshair' : '';
+    });
+
+    document.getElementById('clearBtn').addEventListener('click', clearPolygon);
+
+    function clearPolygon() {
+        state.polygon = null;
+        tempPoints = [];
+        if (state.map.getSource('draw-source')) {
+            state.map.removeLayer('draw-layer');
+            state.map.removeSource('draw-source');
+        }
+        document.getElementById('calculateBtn').disabled = true;
+        state.drawMode = false;
+        const btn = document.getElementById('drawBtn');
+        btn.textContent = "开始绘制多边形";
+        btn.style.backgroundColor = "#007cbf";
+        state.map.getCanvas().style.cursor = '';
+    }
+
+    function handleMapClick(e) {
+        if (!state.drawMode) return;
+
+        tempPoints.push([e.lngLat.lng, e.lngLat.lat]);
+
+        if (tempPoints.length > 2) {
+            // 绘制临时多边形
+            const coordinates = [...tempPoints, tempPoints[0]]; // 闭合
+            updateDrawLayer(coordinates);
+        }
+    }
+
+    function handleMouseMove(e) {
+        if (!state.drawMode || tempPoints.length === 0) return;
+        // 可选：显示跟随鼠标的线
+    }
+
+    function updateDrawLayer(coordinates) {
+        const geojson = {
+            'type': 'Feature',
+            'properties': {},
+            'geometry': {
+                'type': 'Polygon',
+                'coordinates': [coordinates]
+            }
+        };
+
+        if (state.map.getSource('draw-source')) {
+            state.map.getSource('draw-source').setData(geojson);
+        } else {
+            state.map.addSource('draw-source', {
+                'type': 'geojson',
+                'data': geojson
+            });
+            state.map.addLayer({
+                'id': 'draw-layer',
+                'type': 'fill',
+                'source': 'draw-source',
+                'layout': {},
+                'paint': {
+                    'fill-color': '#007cbf',
+                    'fill-opacity': 0.4
+                }
+            });
+        }
+        
+        // 如果点击了起点附近，视为结束绘制 (简化逻辑：双击或再次点击起点，这里简单起见，提供"完成"逻辑或自动检测)
+        // 为了简化原型，我们假设用户画完后点击"计算"按钮，或者这里添加一个距离检测来闭合
+        // 在此原型中，我们让用户手动停止绘制模式或点击计算时确认使用当前形状
+    }
+
+    // 修正：允许用户通过再次点击第一个点或按ESC结束，但为了简单，
+    // 我们修改逻辑：点击"开始绘制"后，连续点击，最后双击结束？
+    // MapLibre 原生不支持双击监听作为绘制结束，我们用简单的策略：
+    // 点击"计算"时，如果有点，就使用当前点集闭合多边形。
+    // 或者添加一个"结束绘制"按钮。这里为了UI简洁，我们在点击计算时检查。
+    
+    // 重新绑定绘制结束逻辑：当用户再次点击"开始绘制"按钮时，视为结束
+    const originalDrawBtnListener = document.getElementById('drawBtn').onclick;
+    document.getElementById('drawBtn').onclick = function() {
+        if (state.drawMode && tempPoints.length > 2) {
+            // 结束绘制
+            state.drawMode = false;
+            this.textContent = "重新绘制";
+            this.style.backgroundColor = "#007cbf";
+            state.map.getCanvas().style.cursor = '';
+            
+            // 闭合多边形
+            const coordinates = [...tempPoints, tempPoints[0]];
+            updateDrawLayer(coordinates);
+            
+            state.polygon = turf.polygon([coordinates]);
+            document.getElementById('calculateBtn').disabled = false;
+            return;
+        }
+        // 否则执行原有的切换逻辑
+        state.drawMode = !state.drawMode;
+        tempPoints = [];
+        if (state.polygon) clearPolygon();
+        this.textContent = state.drawMode ? "绘制中... (点击完成)" : "开始绘制多边形";
+        this.style.backgroundColor = state.drawMode ? "#d9534f" : "#007cbf";
+        state.map.getCanvas().style.cursor = state.drawMode ? 'crosshair' : '';
+    };
+
+
+    // --- 核心计算与渲染逻辑 ---
+
+    document.getElementById('calculateBtn').addEventListener('click', async () => {
+        const urlInput = document.getElementById('cogUrl').value.trim();
+        if (!urlInput) {
+            alert("请输入 COG 数据 URL");
+            return;
+        }
+        if (!state.polygon) {
+            alert("请先绘制一个多边形区域");
+            return;
+        }
+
+        state.cogUrl = urlInput;
+        const indexType = document.getElementById('indexSelect').value;
+        
+        document.getElementById('loading').style.display = 'block';
+
+        try {
+            // 1. 获取多边形的 BBox
+            const bbox = turf.bbox(state.polygon);
+            console.log("Processing BBox:", bbox);
+
+            // 2. 读取 COG 数据
+            // 使用 georaster 读取远程 COG
+            // 注意：COG 服务器必须支持 CORS
+            const georaster = await georaster(urlInput);
+            
+            console.log("COG Loaded:", georaster);
+            console.log("NoData Value:", georaster.noDataValue);
+
+            // 3. 确定波段索引
+            // 这里需要根据实际 COG 的 metadata 来动态判断，或者硬编码假设
+            // 假设标准 Sentinel-2 COG 顺序: B1, B2, B3, B4, B5, B6, B7, B8, B8A, B9, B10, B11, B12
+            // 索引从 0 开始: Red=3, Green=2, NIR=7, SWIR=10
+            
+            let bandRed, bandGreen, bandNir, bandSwir;
+            
+            // 尝试智能匹配波段名称，如果 georaster 包含 rasterNames
+            if (georaster.rasterNames) {
+                const names = georaster.rasterNames.map(n => n.toUpperCase());
+                bandRed = names.findIndex(n => n.includes('B04') || n.includes('RED'));
+                bandGreen = names.findIndex(n => n.includes('B03') || n.includes('GREEN'));
+                bandNir = names.findIndex(n => n.includes('B08') || n.includes('NIR'));
+                bandSwir = names.findIndex(n => n.includes('B11') || n.includes('SWIR'));
+            } else {
+                // Fallback 硬编码 (Sentinel-2 L2A 常见顺序)
+                bandRed = 3;
+                bandGreen = 2;
+                bandNir = 7;
+                bandSwir = 10;
+            }
+
+            if (bandRed === -1 || bandNir === -1) {
+                throw new Error("无法自动识别波段，请检查数据源格式。");
+            }
+
+            // 4. 遍历像素计算指数
+            const { width, height, values } = georaster;
+            const resultValues = new Float32Array(width * height);
+            
+            let minVal = Infinity;
+            let maxVal = -Infinity;
+
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const i = y * width + x;
+                    
+                    // 获取波段值 (注意处理 NoData)
+                    const vRed = values[bandRed][i];
+                    const vGreen = values[bandGreen][i];
+                    const vNir = values[bandNir][i];
+                    const vSwir = values[bandSwir][i];
+
+                    // 简单的 NoData 检查 (假设 0 或特定值为无效，具体看元数据)
+                    if (vRed === georaster.noDataValue || vNir === georaster.noDataValue) {
+                        resultValues[i] = NaN;
+                        continue;
+                    }
+
+                    let val = 0;
+                    const epsilon = 0.0001;
+
+                    if (indexType === 'NDVI') {
+                        val = (vNir - vRed) / (vNir + vRed + epsilon);
+                    } else if (indexType === 'NDWI') {
+                        // (Green - NIR) / (Green + NIR)
+                        val = (vGreen - vNir) / (vGreen + vNir + epsilon);
+                    } else if (indexType === 'EVI') {
+                        // 2.5 * (NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1)
+                        // 需要 Blue 波段 (Index 1)
+                        const vBlue = values[1][i];
+                        val = 2.5 * (vNir - vRed) / (vNir + 6 * vRed - 7.5 * vBlue + 1);
+                    } else if (indexType === 'NDBI') {
+                        // (SWIR - NIR) / (SWIR + NIR)
+                        val = (vSwir - vNir) / (vSwir + vNir + epsilon);
+                    }
+
+                    resultValues[i] = val;
+                    if (val > maxVal) maxVal = val;
+                    if (val < minVal) minVal = val;
+                }
+            }
+
+            // 5. 生成颜色映射并渲染
+            renderResultOnMap(georaster, resultValues, indexType, minVal, maxVal);
+            
+            // 更新图例
+            updateLegend(indexType, minVal, maxVal);
+
+        } catch (error) {
+            console.error(error);
+            alert("处理失败: " + error.message);
+        } finally {
+            document.getElementById('loading').style.display = 'none';
+        }
+    });
+
+    function getColor(value, type, min, max) {
+        if (isNaN(value)) return [0, 0, 0, 0]; // Transparent
+
+        // 归一化到 0-1 (可选，或者直接根据阈值)
+        // 这里使用简单的线性插值映射到预设色带
+        
+        // 针对 NDVI 的经典色带: Red (-1 to 0) -> Yellow -> Green (0 to 1)
+        // 针对 NDWI: Water is high positive. 
+        // 为了通用，我们做一个简单的红 - 黄 - 绿 映射，或者根据类型调整
+        
+        let r, g, b, a = 255;
+        
+        // 简单的归一化，限制在 min-max 范围内，超出则截断
+        let norm = (value - min) / (max - min);
+        norm = Math.max(0, Math.min(1, norm));
+
+        if (type === 'NDVI') {
+            // 红 (低) -> 黄 -> 绿 (高)
+            if (norm < 0.5) {
+                // Red to Yellow
+                r = 255;
+                g = Math.floor(255 * (norm * 2));
+                b = 0;
+            } else {
+                // Yellow to Green
+                r = Math.floor(255 * (1 - (norm - 0.5) * 2));
+                g = 255;
+                b = 0;
+            }
+        } else if (type === 'NDWI') {
+            // 蓝 (高水体) -> 白/浅蓝 -> 灰 (低)
+            // 水通常是正值，越高越蓝
+            r = Math.floor(255 * (1 - norm));
+            g = Math.floor(255 * (1 - norm));
+            b = 255;
+        } else {
+            // 默认：红 -> 绿
+            r = Math.floor(255 * (1 - norm));
+            g = Math.floor(255 * norm);
+            b = 0;
+        }
+
+        return [r, g, b, a];
+    }
+
+    function renderResultOnMap(georaster, data, indexType, min, max) {
+        const { width, height, minX, minY, maxX, maxY } = georaster;
+
+        // 创建一个 Canvas 来绘制计算后的图像
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.createImageData(width, height);
+
+        for (let i = 0; i < data.length; i++) {
+            const [r, g, b, a] = getColor(data[i], indexType, min, max);
+            const idx = i * 4;
+            imageData.data[idx] = r;
+            imageData.data[idx + 1] = g;
+            imageData.data[idx + 2] = b;
+            imageData.data[idx + 3] = a;
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+
+        // 移除旧图层
+        if (state.map.getLayer(state.currentLayerId)) {
+            state.map.removeLayer(state.currentLayerId);
+        }
+        if (state.map.getSource(state.currentLayerId)) {
+            state.map.removeSource(state.currentLayerId);
+        }
+
+        // 添加新图层
+        state.map.addSource(state.currentLayerId, {
+            'type': 'image',
+            'url': canvas.toDataURL(),
+            'coordinates': [
+                [minX, maxY],
+                [maxX, maxY],
+                [maxX, minY],
+                [minX, minY]
+            ]
+        });
+
+        state.map.addLayer({
+            'id': state.currentLayerId,
+            'type': 'raster',
+            'source': state.currentLayerId,
+            'paint': {
+                'raster-opacity': 0.8
+            }
+        });
+    }
+
+    function updateLegend(type, min, max) {
+        const legend = document.getElementById('legend');
+        const bar = document.getElementById('legendBar');
+        const name = document.getElementById('legendName');
+        const minSpan = document.getElementById('minVal');
+        const maxSpan = document.getElementById('maxVal');
+
+        legend.style.display = 'block';
+        name.textContent = type;
+        minSpan.textContent = min.toFixed(2);
+        maxSpan.textContent = max.toFixed(2);
+
+        if (type === 'NDVI') {
+            bar.style.background = 'linear-gradient(to right, red 0%, yellow 50%, green 100%)';
+        } else if (type === 'NDWI') {
+            bar.style.background = 'linear-gradient(to right, gray 0%, white 50%, blue 100%)';
+        } else {
+            bar.style.background = 'linear-gradient(to right, red 0%, yellow 50%, green 100%)';
+        }
+    }
+
+    // 启动
+    initMap();
+
+</script>
+</body>
+</html>
